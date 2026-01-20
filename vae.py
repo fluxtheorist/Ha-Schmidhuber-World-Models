@@ -83,12 +83,25 @@ class ConvVAE(nn.Module):
         recon = self.decode(z)
         return recon, mu, logvar
 
+    def loss_function(self, recon, x, mu, logvar):
+        # Reconstruction loss
+        recon_loss = nn.functional.mse_loss(recon, x, reduction="sum")
+
+        # KL divergence
+        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+
+        return recon_loss + kl_loss, recon_loss, kl_loss
+
 
 if __name__ == "__main__":
     # This only runs when you execute vae.py directly
     model = ConvVAE(latent_dim=32)
     fake_image = torch.randn(1, 3, 64, 64)
     recon, mu, logvar = model(fake_image)
+
+    total_loss, recon_loss, kl_loss = model.loss_function(recon, fake_image, mu, logvar)
+
     print(f"Input: {fake_image.shape}")
     print(f"Reconstruction: {recon.shape}")
-    print(f"mu: {mu.shape}, logvar: {logvar.shape}")
+    print(f"Total loss: {total_loss.item():.2f}")
+    print(f"Recon loss: {recon_loss.item():.2f}, KL loss: {kl_loss.item():.2f}")
