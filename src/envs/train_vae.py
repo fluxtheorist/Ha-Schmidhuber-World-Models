@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
-from vae import ConvVAE
+from src.models.vae import ConvVAE
 
 # Device
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")

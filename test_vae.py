@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from vae import ConvVAE
+from src.models.vae import ConvVAE
 
 # Load model
 model = ConvVAE(latent_dim=32)
