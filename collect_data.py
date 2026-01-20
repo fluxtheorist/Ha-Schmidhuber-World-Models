@@ -4,8 +4,8 @@ from PIL import Image
 import os
 
 # Settings
-NUM_EPISODES = 5
-MAX_STEPS = 200
+NUM_EPISODES = 50
+MAX_STEPS = 500
 os.makedirs("outputs", exist_ok=True)
 
 # Storage for all frames

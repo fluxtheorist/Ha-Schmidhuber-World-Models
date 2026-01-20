@@ -53,7 +53,7 @@ class ConvVAE(nn.Module):
         h = self.relu(self.conv4(h))
 
         # Flatten the conv output
-        h = h.view(h.size(0), -1)
+        h = h.reshape(h.size(0), -1)
 
         mu = self.fc_mu(h)
         logvar = self.fc_logvar(h)
