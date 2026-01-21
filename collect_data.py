@@ -31,6 +31,8 @@ env.close()
 
 # Convert to np array and save
 all_frames = np.array(all_frames)
+all_actions = np.array(all_actions)
 print(f"Collected {len(all_frames)} frames with shape {all_frames.shape}")
+print(f"Collected {len(all_actions)} actions with shape {all_actions.shape}")
 np.save("outputs/frames.npy", all_frames)
 np.save("outputs/actions.npy", all_actions)
