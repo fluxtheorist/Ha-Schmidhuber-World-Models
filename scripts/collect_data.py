@@ -10,7 +10,7 @@ os.makedirs("outputs", exist_ok=True)
 
 # Storage for all frames
 all_frames = []
-
+all_actions = []
 # Create enviornment
 env = gym.make("CarRacing-v3", continuous=True)
 
@@ -21,6 +21,7 @@ for episode in range(NUM_EPISODES):
         img = Image.fromarray(obs).resize((64, 64))
         all_frames.append(np.array(img))
         action = env.action_space.sample()
+        all_actions.append(action)
         obs, reward, terminated, truncated, info = env.step(action)
 
         if terminated or truncated:
@@ -32,3 +33,4 @@ env.close()
 all_frames = np.array(all_frames)
 print(f"Collected {len(all_frames)} frames with shape {all_frames.shape}")
 np.save("outputs/frames.npy", all_frames)
+np.save("outputs/actions.npy", all_actions)
