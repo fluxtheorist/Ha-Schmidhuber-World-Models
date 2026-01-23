@@ -11,7 +11,7 @@ device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 # Load trained models
 vae = ConvVAE(latent_dim=32)
-vae.load_state_dict(torch.load("outputs/vae.path"))
+vae.load_state_dict(torch.load("outputs/vae.pth"))
 vae.to(device)
 vae.eval()
 
@@ -39,7 +39,7 @@ def get_action(obs, hidden, controller, vae, mdn_rnn):
         # Action from controller
         action = controller(z, h)
 
-        return action.cpu().numpy()
+        return action.cpu().numpy(), z
 
 
 def rollout(controller, vae, mdn_rnn, render=False):
@@ -50,7 +50,7 @@ def rollout(controller, vae, mdn_rnn, render=False):
     # Resize obs
     from PIL import Image
 
-    obs = np.array(Image.fromarray(obs).resize(64, 64))
+    obs = np.array(Image.fromarray(obs).resize((64, 64)))
 
     # Initialize RNN hidden state
     hidden = (torch.zeros(1, 1, 256).to(device), torch.zeros(1, 1, 256).to(device))
@@ -61,7 +61,7 @@ def rollout(controller, vae, mdn_rnn, render=False):
 
         # Gas and brakes
         action_env = np.array([action[0], (action[1] + 1) / 2, (action[2] + 1) / 2])
-        obs, reward, terminated, truncated = env.step(action_env)
+        obs, reward, terminated, truncated, _ = env.step(action_env)
         obs = np.array(Image.fromarray(obs).resize((64, 64)))
         total_reward += reward
 
@@ -95,3 +95,33 @@ def set_controller_params(contoller, params):
 
 
 # CMA-ES optimization
+n_params = sum(p.numel() for p in controller.parameters())
+print(f"Optimizing {n_params} parameters")
+
+es = cma.CMAEvolutionStrategy(n_params * [0], 0.5)
+
+generation = 0
+while not es.stop():
+    # Get population of candidate solutions
+    solutions = es.ask()
+
+    fitness = []
+    for params in solutions:
+        set_controller_params(controller, np.array(params))
+        reward = rollout(controller, vae, mdn_rnn)
+        fitness.append(-reward)
+
+    es.tell(solutions, fitness)
+
+    generation += 1
+    best_reward = -min(fitness)
+    mean_reward = -np.mean(fitness)
+    print(f"Gen {generation}: Best={best_reward:.1f}, Mean={mean_reward:.1f}")
+
+    if generation >= 50:
+        break
+
+# Save best controller
+set_controller_params(controller, es.result.xbest)
+torch.save(controller.state_dict(), "outputs/controller.pth")
+print("Saved best controller")
