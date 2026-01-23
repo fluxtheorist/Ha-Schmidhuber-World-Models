@@ -1,6 +1,6 @@
 import torch
-import time
 import numpy as np
+import cma
 from vae import ConvVAE
 from mdn_rnn import MDNRNN
 from controller import Controller
@@ -8,6 +8,7 @@ from reward_predictor import RewardPredictor
 from dream_env import DreamEnv
 
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+print(f"Using device: {device}")
 
 # Load models
 vae = ConvVAE(latent_dim=32)
@@ -20,17 +21,15 @@ mdn_rnn.load_state_dict(torch.load("outputs/mdn_rnn.pth"))
 mdn_rnn.to(device)
 mdn_rnn.eval()
 
-controller = Controller()
-controller.load_state_dict(torch.load("outputs/controller.pth"))
-controller.to(device)
-controller.eval()
-
 reward_predictor = RewardPredictor(latent_dim=32, hidden_dim=64)
 reward_predictor.load_state_dict(torch.load("outputs/reward_predictor.pth"))
 reward_predictor.to(device)
 reward_predictor.eval()
 
-# Load initial z vectors from real data
+controller = Controller()
+controller.to(device)
+
+# Get initial z vectors
 frames = np.load("outputs/frames.npy")
 frames_tensor = torch.from_numpy(frames).float() / 255.0
 frames_tensor = frames_tensor.permute(0, 3, 1, 2)
@@ -43,15 +42,26 @@ with torch.no_grad():
         all_z.append(mu.cpu())
     all_z = torch.cat(all_z, dim=0)
 
+print(f"Loaded {len(all_z)} initial z vectors")
 
 # Create dream environment
 dream = DreamEnv(mdn_rnn, reward_predictor, all_z, device, temperature=1.0)
 
-# Run 10 dream episodes and time it
-n_episodes = 10
-start = time.time()
 
-for ep in range(n_episodes):
+def set_params(controller, params):
+    idx = 0
+    for p in controller.parameters():
+        size = p.numel()
+        p.data = (
+            torch.from_numpy(params[idx : idx + size])
+            .float()
+            .reshape(p.shape)
+            .to(device)
+        )
+        idx += size
+
+
+def dream_rollout(controller, dream):
     z, h = dream.reset()
     total_reward = 0
 
@@ -59,11 +69,32 @@ for ep in range(n_episodes):
         action = controller(z, h)
         z, h, reward, done = dream.step(action)
         total_reward += reward
-
         if done:
             break
 
-    print(f"Dream {ep+1}: reward={total_reward:.1f}")
+    return total_reward
 
-elapsed = time.time() - start
-print(f"\n{n_episodes} episodes in {elapsed:.2f}s ({elapsed/n_episodes:.3f}s each)")
+
+# CMA-ES in dreams
+n_params = sum(p.numel() for p in controller.parameters())
+print(f"Optimizing {n_params} parameters in dreams")
+
+es = cma.CMAEvolutionStrategy(n_params * [0], 0.5, {"popsize": 16})
+
+for gen in range(100):
+    solutions = es.ask()
+
+    rewards = []
+    for params in solutions:
+        set_params(controller, np.array(params))
+        r = dream_rollout(controller, dream)
+        rewards.append(r)
+
+    es.tell(solutions, [-r for r in rewards])
+
+    print(f"Gen {gen+1}: Best={max(rewards):.1f}, Mean={np.mean(rewards):.1f}")
+
+# Save dream-trained controller
+set_params(controller, es.result.xbest)
+torch.save(controller.state_dict(), "outputs/controller_dream.pth")
+print("Saved dream-trained controller")

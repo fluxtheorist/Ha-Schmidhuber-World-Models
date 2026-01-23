@@ -4,8 +4,11 @@ import torch
 class DreamEnv:
     # Enviornment that runs in the MDN-RNN imagination
 
-    def __init__(self, mdn_rnn, initial_z_bank, device, temperature=1.0):
+    def __init__(
+        self, mdn_rnn, reward_predictor, initial_z_bank, device, temperature=1.0
+    ):
         self.mdn_rnn = mdn_rnn
+        self.reward_predictor = reward_predictor
         self.device = device
         self.temperature = temperature
         self.initial_z_bank = initial_z_bank
@@ -42,10 +45,11 @@ class DreamEnv:
             # Sample next z
             self.z = self.mdn_rnn.sample(pi, mu, sigma).squeeze(0).squeeze(0)
 
+            # Predict reward from new z
+            reward = self.reward_predictor(self.z.unsqueeze(0)).item()
+
         self.steps += 1
         h = self.hidden[0].squeeze(0).squeeze(0)
-
         done = self.steps >= 500
-        reward = 0.1
 
         return self.z, h, reward, done
