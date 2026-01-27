@@ -56,7 +56,7 @@ def rollout(controller, vae, mdn_rnn, render=False):
     hidden = (torch.zeros(1, 1, 256).to(device), torch.zeros(1, 1, 256).to(device))
     total_reward = 0
 
-    for step in range(1000):
+    for step in range(500):
         action, z = get_action(obs, hidden, controller, vae, mdn_rnn)
 
         # Gas and brakes
@@ -94,34 +94,46 @@ def set_controller_params(contoller, params):
         idx += size
 
 
-# CMA-ES optimization
-n_params = sum(p.numel() for p in controller.parameters())
-print(f"Optimizing {n_params} parameters")
+if __name__ == "__main__":
+    # CMA-ES optimization
+    n_params = sum(p.numel() for p in controller.parameters())
+    print(f"Optimizing {n_params} parameters")
 
-es = cma.CMAEvolutionStrategy(n_params * [0], 0.5)
+    es = cma.CMAEvolutionStrategy(n_params * [0], 0.5)
 
-generation = 0
-while not es.stop():
-    # Get population of candidate solutions
-    solutions = es.ask()
+    generation = 0
+    while not es.stop():
+        # Get population of candidate solutions
+        solutions = es.ask()
 
-    fitness = []
-    for params in solutions:
-        set_controller_params(controller, np.array(params))
-        reward = rollout(controller, vae, mdn_rnn)
-        fitness.append(-reward)
+        fitness = []
+        for params in solutions:
+            set_controller_params(controller, np.array(params))
+            reward = rollout(controller, vae, mdn_rnn)
+            fitness.append(-reward)
 
-    es.tell(solutions, fitness)
+        es.tell(solutions, fitness)
 
-    generation += 1
-    best_reward = -min(fitness)
-    mean_reward = -np.mean(fitness)
-    print(f"Gen {generation}: Best={best_reward:.1f}, Mean={mean_reward:.1f}")
+        generation += 1
+        best_reward = -min(fitness)
+        mean_reward = -np.mean(fitness)
+        print(f"Gen {generation}: Best={best_reward:.1f}, Mean={mean_reward:.1f}")
 
-    if generation >= 50:
-        break
+        if generation >= 50:
+            break
 
-# Save best controller
-set_controller_params(controller, es.result.xbest)
-torch.save(controller.state_dict(), "outputs/controller.pth")
-print("Saved best controller")
+    # Save best controller as raw numpy array
+    best_params = np.array(es.result.xbest)
+    np.save("outputs/controller_params.npy", best_params)
+    print(f"Saved best params to outputs/controller_params.npy")
+
+    # Verify it works
+    set_controller_params(controller, best_params)
+    test_reward = rollout(controller, vae, mdn_rnn)
+    print(f"Verification reward: {test_reward:.1f}")
+
+    # Also verify load works
+    loaded_params = np.load("outputs/controller_params.npy")
+    set_controller_params(controller, loaded_params)
+    test_reward2 = rollout(controller, vae, mdn_rnn)
+    print(f"After reload reward: {test_reward2:.1f}")
