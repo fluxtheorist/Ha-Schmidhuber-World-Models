@@ -3,27 +3,49 @@ Collect data using trained controller.
 Step 1 of iterative training.
 """
 
+import sys
+
+sys.path.append("..")
+
 import torch
 import numpy as np
 import gymnasium as gym
 from PIL import Image
-from vae import ConvVAE
-from mdn_rnn import MDNRNN
-from controller import Controller
+import os
+import argparse
+from models.vae import ConvVAE
+from models.mdn_rnn import MDNRNN
+from models.controller import Controller
 
-# Settings
-NUM_EPISODES = 50
-MAX_STEPS = 500
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--iter",
+    type=int,
+    required=True,
+    help="Iteration to collect FOR (loads models from iter-1)",
+)
+parser.add_argument("--episodes", type=int, default=50, help="Number of episodes")
+parser.add_argument("--max_steps", type=int, default=500, help="Max steps per episode")
+args = parser.parse_args()
+
+# Load from previous iteration, save to current
+load_dir = f"../outputs/iter{args.iter - 1}"
+output_dir = f"../outputs/iter{args.iter}"
+os.makedirs(output_dir, exist_ok=True)
+
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
+print(f"Loading models from {load_dir}")
+print(f"Saving data to {output_dir}")
 
 # Load models
 vae = ConvVAE(latent_dim=32)
-vae.load_state_dict(torch.load("outputs/vae.pth"))
+vae.load_state_dict(torch.load(f"{load_dir}/vae.pth"))
 vae.to(device)
 vae.eval()
 
 mdn_rnn = MDNRNN(latent_dim=32, action_dim=3, hidden_dim=256, n_gaussians=5)
-mdn_rnn.load_state_dict(torch.load("outputs/mdn_rnn.pth"))
+mdn_rnn.load_state_dict(torch.load(f"{load_dir}/mdn_rnn.pth"))
 mdn_rnn.to(device)
 mdn_rnn.eval()
 
@@ -45,7 +67,7 @@ def set_controller_params(params):
         idx += size
 
 
-params = np.load("outputs/controller_params.npy")
+params = np.load(f"{load_dir}/controller_params.npy")
 set_controller_params(params)
 controller.eval()
 
@@ -58,14 +80,14 @@ episode_rewards = []
 
 env = gym.make("CarRacing-v3", continuous=True)
 
-for episode in range(NUM_EPISODES):
+for episode in range(args.episodes):
     obs, _ = env.reset()
     obs = np.array(Image.fromarray(obs).resize((64, 64)))
 
     hidden = (torch.zeros(1, 1, 256).to(device), torch.zeros(1, 1, 256).to(device))
     episode_reward = 0
 
-    for step in range(MAX_STEPS):
+    for step in range(args.max_steps):
         all_frames.append(obs.copy())
 
         with torch.no_grad():
@@ -95,7 +117,7 @@ for episode in range(NUM_EPISODES):
             break
 
     episode_rewards.append(episode_reward)
-    print(f"Episode {episode+1}/{NUM_EPISODES}: {episode_reward:.1f}")
+    print(f"Episode {episode+1}/{args.episodes}: {episode_reward:.1f}")
 
 env.close()
 
@@ -105,6 +127,6 @@ all_actions = np.array(all_actions)
 print(f"\nCollected {len(all_frames)} frames")
 print(f"Average reward: {np.mean(episode_rewards):.1f} ± {np.std(episode_rewards):.1f}")
 
-np.save("outputs/frames_iter1.npy", all_frames)
-np.save("outputs/actions_iter1.npy", all_actions)
-print("Saved to outputs/frames_iter1.npy and actions_iter1.npy")
+np.save(f"{output_dir}/frames.npy", all_frames)
+np.save(f"{output_dir}/actions.npy", all_actions)
+print(f"Saved to {output_dir}/")
