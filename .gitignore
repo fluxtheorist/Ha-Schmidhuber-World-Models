@@ -3,3 +3,4 @@ venv
 outputs
 simple_autoencoder.py
 __pycache__
+reorganize_repo.sh
