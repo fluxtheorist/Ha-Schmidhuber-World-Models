@@ -47,8 +47,8 @@ if __name__ == "__main__":
     # Load and encode all data up to this iteration
     all_z_list = []
     all_actions_list = []
-    episode_lengths_list = []
 
+    total_frames = 0
     for i in range(args.iter + 1):
         iter_dir = f"../outputs/iter{i}"
         try:
@@ -60,39 +60,29 @@ if __name__ == "__main__":
 
             all_z_list.append(z)
             all_actions_list.append(torch.from_numpy(actions).float())
-
-            # Try to load episode lengths, otherwise assume 500
-            try:
-                ep_lens = np.load(f"{iter_dir}/episode_lengths.npy")
-                episode_lengths_list.append(ep_lens)
-            except FileNotFoundError:
-                # Assume 50 episodes of ~500 steps
-                episode_lengths_list.append(np.array([500] * 50))
+            total_frames += len(frames)
 
         except FileNotFoundError:
             print(f"No data found for iter{i}, skipping")
 
     all_z = torch.cat(all_z_list, dim=0)
     all_actions = torch.cat(all_actions_list, dim=0)
-    all_episode_lengths = np.concatenate(episode_lengths_list)
 
-    print(f"Total: {len(all_z)} encoded frames, {len(all_episode_lengths)} episodes")
+    print(f"Total: {len(all_z)} encoded frames")
 
     # Training params
     SEQ_LEN = 50
     BATCH_SIZE = 32
 
-    # Build episode start indices
-    episode_starts = [0]
-    for length in all_episode_lengths[:-1]:
-        episode_starts.append(episode_starts[-1] + length)
-    episode_starts = np.array(episode_starts)
-    n_episodes = len(episode_starts)
-
     # Create MDN-RNN
     model = MDNRNN(latent_dim=32, action_dim=3, hidden_dim=256, n_gaussians=5)
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    # Simple approach: just sample random contiguous sequences from ALL data
+    # This ignores episode boundaries but works fine in practice
+    max_start_idx = len(all_z) - SEQ_LEN - 1
+    print(f"Sampling sequences from indices 0 to {max_start_idx}")
 
     # Training loop
     for epoch in range(args.epochs):
@@ -105,18 +95,8 @@ if __name__ == "__main__":
             batch_target = []
 
             for _ in range(BATCH_SIZE):
-                # Pick random episode
-                ep = np.random.randint(n_episodes)
-                ep_start = episode_starts[ep]
-                ep_len = all_episode_lengths[ep]
-
-                # Pick random start within episode (need SEQ_LEN + 1 frames)
-                if ep_len <= SEQ_LEN + 1:
-                    continue  # Skip short episodes
-
-                max_start = ep_len - SEQ_LEN - 1
-                start = np.random.randint(max_start)
-                idx = ep_start + start
+                # Pick random start index
+                idx = np.random.randint(0, max_start_idx)
 
                 # Get sequence
                 z_seq = all_z[idx : idx + SEQ_LEN]
@@ -126,9 +106,6 @@ if __name__ == "__main__":
                 batch_z.append(z_seq)
                 batch_a.append(a_seq)
                 batch_target.append(target_seq)
-
-            if len(batch_z) == 0:
-                continue
 
             batch_z = torch.stack(batch_z).to(device)
             batch_a = torch.stack(batch_a).to(device)
