@@ -86,3 +86,35 @@ class MDNRNN(nn.Module):
         log_likelihood = torch.logsumexp(log_weighted, dim=-1)
 
         return -log_likelihood.mean()
+
+
+if __name__ == "__main__":
+    # Test VizDoom config
+    model = MDNRNN(latent_dim=64, action_dim=3, hidden_dim=512)
+
+    batch_size = 4
+    seq_len = 10
+
+    z = torch.randn(batch_size, seq_len, 64)
+    action = torch.randint(0, 3, (batch_size, seq_len))  # Discrete actions
+    target_z = torch.randn(batch_size, seq_len, 64)
+    target_death = torch.zeros(batch_size, seq_len)  # No deaths
+    target_death[:, -1] = 1.0  # Death at end of each sequence
+
+    mdn_out, death_logits, hidden = model(z, action)
+    pi, mu, sigma = model.get_mdn_params(mdn_out)
+    z_sample = model.sample(pi, mu, sigma)
+
+    mdn_loss = model.loss_function(pi, mu, sigma, target_z)
+    d_loss = model.death_loss(death_logits, target_death)
+
+    print(f"Input z: {z.shape}")
+    print(f"Input action: {action.shape}")
+    print(f"MDN out: {mdn_out.shape}")
+    print(f"Death logits: {death_logits.shape}")
+    print(f"pi: {pi.shape}")
+    print(f"mu: {mu.shape}")
+    print(f"sigma: {sigma.shape}")
+    print(f"Sampled z: {z_sample.shape}")
+    print(f"MDN loss: {mdn_loss.item():.2f}")
+    print(f"Death loss: {d_loss.item():.2f}")
