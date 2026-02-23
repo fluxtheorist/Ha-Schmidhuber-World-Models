@@ -19,6 +19,12 @@ if __name__ == "__main__":
     # Arguments
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--death_weight",
+        type=float,
+        default=200.0,
+        help="Weight for death loss (compensates class imbalance)",
+    )
+    parser.add_argument(
         "--data_dir",
         type=str,
         default="../outputs/vizdoom/iter0",
@@ -96,8 +102,39 @@ if __name__ == "__main__":
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     print(f"MDNRNN: latent_dim=64, action_dim=3, hidden_dim=512, n_gaussians=5")
 
+    # Find death frame indices for oversampling
+    death_indices = torch.where(all_dones == 1)[0].numpy()
+    print(
+        f"Death frames: {len(death_indices)} ({100*len(death_indices)/len(all_dones):.2f}%)"
+    )
+
     # Training loop
     max_start_idx = len(all_z) - args.sequence_length - 1
+    # Precompute valid starting indices (sequences that don't cross episode boundaries)
+    print("Finding valid sequence starts...")
+    valid_starts = []
+    death_set = set(death_indices.tolist())
+    for idx in range(max_start_idx):
+        # Check if any frame in positions [idx, idx+seq_len-2] is a death
+        # (death at the last position idx+seq_len-1 is OK)
+        chunk = all_dones[idx : idx + args.sequence_length - 1]
+        if chunk.sum() == 0:
+            valid_starts.append(idx)
+    valid_starts = np.array(valid_starts)
+    print(
+        f"Valid starts: {len(valid_starts)} / {max_start_idx} ({100*len(valid_starts)/max_start_idx:.1f}%)"
+    )
+
+    # Also find valid starts that end in death (for oversampling)
+    death_starts = []
+    for d_idx in death_indices:
+        idx = max(0, d_idx - args.sequence_length + 1)
+        idx = min(idx, max_start_idx)
+        chunk = all_dones[idx : idx + args.sequence_length - 1]
+        if chunk.sum() == 0:
+            death_starts.append(idx)
+    death_starts = np.array(death_starts)
+    print(f"Death-anchored valid starts: {len(death_starts)}")
     for epoch in range(args.epochs):
         total_mdn_loss = 0
         death_loss = 0
@@ -110,7 +147,11 @@ if __name__ == "__main__":
             target_z_batch = []
 
             for _ in range(args.batch_size):
-                idx = np.random.randint(0, max_start_idx)
+                if np.random.random() < 0.5 and len(death_starts) > 0:
+                    idx = death_starts[np.random.randint(len(death_starts))]
+                else:
+                    idx = valid_starts[np.random.randint(len(valid_starts))]
+
                 z_batch.append(all_z[idx : idx + args.sequence_length])
                 a_batch.append(all_actions[idx : idx + args.sequence_length])
                 d_batch.append(all_dones[idx + 1 : idx + args.sequence_length + 1])
@@ -127,7 +168,9 @@ if __name__ == "__main__":
 
             mdn_loss = model.loss_function(pi, mu, sigma, target_z_batch)
             d_loss = model.death_loss(death_logits, d_batch)
-            loss = mdn_loss + d_loss
+            # Weight death loss to compensate for class imbalance
+            # (~0.5% of frames are deaths, so ~200x weight balances it)
+            loss = mdn_loss + args.death_weight * d_loss
 
             loss.backward()
             optimizer.step()

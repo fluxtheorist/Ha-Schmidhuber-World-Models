@@ -15,12 +15,10 @@ class MDNRNN(nn.Module):
         self.hidden_dim = hidden_dim
         self.n_gaussians = n_gaussians
 
-        # MDN output
-        mdn_output_dim = n_gaussians * (1 + 2 * latent_dim)
-        self.fc_mdn = nn.Linear(hidden_dim, mdn_output_dim)
-
-        # Death prediction head
-        self.fc_death = nn.Linear(hidden_dim, 1)
+        # Combined output: GMM params + reward + terminal
+        # (2 * latent_dim + 1) * n_gaussians for GMM + 1 reward + 1 terminal
+        output_dim = (2 * latent_dim + 1) * n_gaussians + 2
+        self.fc_out = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, z, action, hidden=None):
         # One-hot encode discrete actions if needed
@@ -31,20 +29,26 @@ class MDNRNN(nn.Module):
 
         lstm_out, hidden = self.lstm(x, hidden)
 
-        mdn_out = self.fc_mdn(lstm_out)
-        death_logits = self.fc_death(lstm_out)
+        out = self.fc_out(lstm_out)
 
-        return mdn_out, death_logits, hidden
+        # Split: GMM params, reward, terminal
+        gmm_out = out[:, :, :-2]
+        reward_out = out[:, :, -2]  # not used for VizDoom but matches reference
+        death_logits = out[:, :, -1:]
+
+        return gmm_out, death_logits, hidden
 
     def get_mdn_params(self, mdn_out):
         n_g = self.n_gaussians
         lat = self.latent_dim
 
-        pi = mdn_out[:, :, :n_g]
-        mu = mdn_out[:, :, n_g : n_g + n_g * lat]
-        sigma = mdn_out[:, :, n_g + n_g * lat :]
+        stride = n_g * lat
 
-        pi = torch.softmax(pi, dim=-1)
+        mu = mdn_out[:, :, :stride]
+        sigma = mdn_out[:, :, stride : 2 * stride]
+        pi = mdn_out[:, :, 2 * stride : 2 * stride + n_g]
+
+        pi = F.log_softmax(pi, dim=-1)  # log softmax like ctallec
         sigma = torch.exp(sigma)
 
         mu = mu.view(mu.size(0), mu.size(1), n_g, lat)
@@ -57,8 +61,10 @@ class MDNRNN(nn.Module):
         return F.binary_cross_entropy_with_logits(death_logits, target_death)
 
     def sample(self, pi, mu, sigma):
+        # pi is now log_softmax, need exp for multinomial
         batch_size, seq_len, n_gaussians = pi.shape
-        pi_flat = pi.view(-1, n_gaussians)
+        pi_exp = torch.exp(pi)
+        pi_flat = pi_exp.view(-1, n_gaussians)
 
         indices = torch.multinomial(pi_flat, 1)
         indices = indices.view(batch_size, seq_len)
@@ -72,6 +78,7 @@ class MDNRNN(nn.Module):
         return z
 
     def loss_function(self, pi, mu, sigma, target_z):
+        # pi is log_softmax already
         target_z = target_z.unsqueeze(2)
 
         log_prob = (
@@ -80,26 +87,24 @@ class MDNRNN(nn.Module):
             - 0.5 * ((target_z - mu) / sigma) ** 2
         )
 
-        log_prob = log_prob.sum(dim=-1)
-        log_pi = torch.log(pi + 1e-8)
-        log_weighted = log_prob + log_pi
+        log_prob = log_prob.sum(dim=-1)  # sum over latent dims
+        log_weighted = log_prob + pi  # pi is already log
         log_likelihood = torch.logsumexp(log_weighted, dim=-1)
 
         return -log_likelihood.mean()
 
 
 if __name__ == "__main__":
-    # Test VizDoom config
     model = MDNRNN(latent_dim=64, action_dim=3, hidden_dim=512)
 
     batch_size = 4
     seq_len = 10
 
     z = torch.randn(batch_size, seq_len, 64)
-    action = torch.randint(0, 3, (batch_size, seq_len))  # Discrete actions
+    action = torch.randint(0, 3, (batch_size, seq_len))
     target_z = torch.randn(batch_size, seq_len, 64)
-    target_death = torch.zeros(batch_size, seq_len)  # No deaths
-    target_death[:, -1] = 1.0  # Death at end of each sequence
+    target_death = torch.zeros(batch_size, seq_len)
+    target_death[:, -1] = 1.0
 
     mdn_out, death_logits, hidden = model(z, action)
     pi, mu, sigma = model.get_mdn_params(mdn_out)
@@ -108,13 +113,12 @@ if __name__ == "__main__":
     mdn_loss = model.loss_function(pi, mu, sigma, target_z)
     d_loss = model.death_loss(death_logits, target_death)
 
+    total = sum(p.numel() for p in model.parameters())
+    print(f"Params: {total:,}")
     print(f"Input z: {z.shape}")
-    print(f"Input action: {action.shape}")
     print(f"MDN out: {mdn_out.shape}")
     print(f"Death logits: {death_logits.shape}")
-    print(f"pi: {pi.shape}")
-    print(f"mu: {mu.shape}")
-    print(f"sigma: {sigma.shape}")
+    print(f"pi: {pi.shape}, mu: {mu.shape}, sigma: {sigma.shape}")
     print(f"Sampled z: {z_sample.shape}")
     print(f"MDN loss: {mdn_loss.item():.2f}")
     print(f"Death loss: {d_loss.item():.2f}")

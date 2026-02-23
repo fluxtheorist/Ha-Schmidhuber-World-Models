@@ -88,6 +88,8 @@ def dream_rollout(
             torch.zeros(1, 1, mdn_rnn.hidden_dim, device=device),
         )
 
+        cumulative_survival = 1.0
+
         for step in range(max_steps):
             h_cpu = hidden[0].squeeze(0).squeeze(0).detach().cpu()
             c_cpu = hidden[1].squeeze(0).squeeze(0).detach().cpu()
@@ -101,8 +103,10 @@ def dream_rollout(
             z_next = mdn_rnn.sample(pi, mu, sigma * temperature).squeeze(0).squeeze(0)
 
             death_prob = torch.sigmoid(death_logits[:, -1, :]).item()
+            cumulative_survival *= 1.0 - death_prob
             z = z_next
-            if death_prob > 0.5:
+            # Episode ends when cumulative survival drops below threshold
+            if cumulative_survival < 0.01:
                 return step + 1
 
         return max_steps
