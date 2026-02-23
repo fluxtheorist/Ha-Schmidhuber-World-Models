@@ -19,10 +19,10 @@ if __name__ == "__main__":
     # Arguments
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--death_weight",
-        type=float,
-        default=200.0,
-        help="Weight for death loss (compensates class imbalance)",
+        "--latent_dim",
+        type=int,
+        default=64,
+        help="Latent dimension for loss normalization",
     )
     parser.add_argument(
         "--data_dir",
@@ -170,7 +170,7 @@ if __name__ == "__main__":
             d_loss = model.death_loss(death_logits, d_batch)
             # Weight death loss to compensate for class imbalance
             # (~0.5% of frames are deaths, so ~200x weight balances it)
-            loss = mdn_loss + args.death_weight * d_loss
+            loss = (mdn_loss + d_loss) / args.latent_dim  # normalize by LSIZE
 
             loss.backward()
             optimizer.step()
