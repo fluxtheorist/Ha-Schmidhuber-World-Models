@@ -73,17 +73,20 @@ class Controller:
 # Dream rollout matching Ha's DoomCoverRNNEnv._step
 # ================================================================
 
-TEMPERATURE = 1.25  # Ha line 24
+TEMPERATURE = 1.15  # Ha appendix A.5: tau=1.15 gave best real transfer (1092±556)
 MAX_FRAMES = 2100  # Ha line 560
+ENTROPY_BONUS = (
+    200  # Bonus scaling for action diversity (max entropy ≈ 1.1, so max bonus ≈ 220)
+)
 
 
 def dream_rollout(rnn, controller, initial_z_data, device):
     """Run one episode in the dream environment.
 
-    Matches Ha's DoomCoverRNNEnv reset + step loop.
-    Returns number of steps survived (reward = 1 per step).
+    Returns (steps_survived, action_counts) where action_counts is [left, stay, right].
     """
     rnn.eval()
+    action_counts = [0, 0, 0]
 
     with torch.no_grad():
         # Sample initial z (Ha lines 566-572)
@@ -102,7 +105,8 @@ def dream_rollout(rnn, controller, initial_z_data, device):
             c_np = state[1][0].cpu().numpy()  # (rnn_size,)
 
             # Controller action
-            _, action_float = controller.act(z, h_np, c_np)
+            action_idx, action_float = controller.act(z, h_np, c_np)
+            action_counts[action_idx] += 1
 
             # RNN step
             z_tensor = torch.from_numpy(z).float().unsqueeze(0).to(device)  # (1, 64)
@@ -116,11 +120,11 @@ def dream_rollout(rnn, controller, initial_z_data, device):
             # Check termination (Ha line 644: logrestart[0] > 0)
             if restart_logit > 0:
                 restart = 1.0
-                return step + 1  # reward = steps survived
+                return step + 1, action_counts
             else:
                 restart = 0.0
 
-        return MAX_FRAMES
+        return MAX_FRAMES, action_counts
 
 
 # ================================================================
@@ -152,12 +156,25 @@ def evaluate_worker(args):
     weights, num_rollouts = args
     controller = Controller(weights=weights)
 
-    rewards = []
+    fitnesses = []
     for _ in range(num_rollouts):
-        r = dream_rollout(_WORKER_RNN, controller, _WORKER_INIT_Z, _WORKER_DEVICE)
-        rewards.append(r)
+        steps, action_counts = dream_rollout(
+            _WORKER_RNN, controller, _WORKER_INIT_Z, _WORKER_DEVICE
+        )
 
-    return float(np.mean(rewards))
+        # Entropy bonus: reward action diversity to prevent degenerate strategies
+        total_actions = sum(action_counts)
+        if total_actions > 0:
+            probs = [c / total_actions for c in action_counts]
+            entropy = -sum(p * np.log(p + 1e-10) for p in probs)
+        else:
+            entropy = 0.0
+        # Max entropy for 3 actions = log(3) ≈ 1.099
+        # Scale so entropy bonus is significant but doesn't dominate survival
+        fitness = steps + ENTROPY_BONUS * entropy
+        fitnesses.append(fitness)
+
+    return float(np.mean(fitnesses))
 
 
 # ================================================================
@@ -206,8 +223,13 @@ if __name__ == "__main__":
     init_z_dict = {"mu": init_z["mu"], "logvar": init_z["logvar"]}
 
     test_ctrl = Controller()  # zero weights
-    test_reward = dream_rollout(rnn, test_ctrl, init_z_dict, torch.device("cpu"))
+    test_reward, test_actions = dream_rollout(
+        rnn, test_ctrl, init_z_dict, torch.device("cpu")
+    )
     print(f"  Zero-weight controller survived {test_reward} steps")
+    print(
+        f"  Actions: left={test_actions[0]}, stay={test_actions[1]}, right={test_actions[2]}"
+    )
     del rnn
 
     # Start CMA-ES
