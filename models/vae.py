@@ -3,7 +3,7 @@ import torch.nn as nn
 
 
 class ConvVAE(nn.Module):
-    """VAE matching Ha's doomrnn.py ConvVAE architecture
+    """VAE matching Ha's doomrnn.py ConvVAE architecture.
 
     Key: uses kl_tolerance (free bits) to prevent posterior collapse.
     Ha's default: kl_tolerance=0.5, meaning each latent dim must encode

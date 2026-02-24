@@ -1,283 +1,254 @@
-import os
+#!/usr/bin/env python3
+"""
+CMA-ES controller training in MDN-RNN dream environment.
+Matches Ha's DoomCoverRNNEnv and controller architecture.
+
+Controller: linear map from [z(64), h(512), c(512)] = 1088 -> scalar action
+Dream env: MDN-RNN generates next z, restart_logit > 0 means death
+Reward: +1 per step survived
+Temperature: 1.25
+
+Usage:
+    python train_controller_vizdoom.py --data_dir ../outputs/vizdoom/iter0
+"""
+
 import sys
 
 sys.path.append("..")
 
+import os
 import argparse
-import multiprocessing
 import time
-
-import cma
+import multiprocessing
 import numpy as np
 import torch
 
 from models.mdn_rnn import MDNRNN
-from models.vae import ConvVAE
 
-_WORKER_MDN_RNN = None
-_WORKER_Z_BANK = None
-_WORKER_DEVICE = None
+# ================================================================
+# Controller: 1088 weights -> action (Ha's architecture)
+# ================================================================
 
 
-class ControllerVizDoom:
-    def __init__(self, latent_dim=64, hidden_dim=512, weights=None):
-        self.latent_dim = latent_dim
-        self.hidden_dim = hidden_dim
-        self.input_dim = 1088
+class Controller:
+    """Linear controller: [z, h, c] -> action.
 
-        if latent_dim + hidden_dim + hidden_dim != self.input_dim:
-            raise ValueError("latent_dim + hidden_dim + hidden_dim must equal 1088")
+    Ha's observation (line 576): concatenate(z, c, h)  [note: c before h]
+    Action: scalar in [-1, 1], discretized to {0=left, 1=stay, 2=right}
+    """
 
-        self.z = np.zeros(self.latent_dim, dtype=np.float32)
-        self.h = np.zeros(self.hidden_dim, dtype=np.float32)
-        self.c = np.zeros(self.hidden_dim, dtype=np.float32)
-
+    def __init__(self, weights=None):
+        self.input_dim = 64 + 512 + 512  # z + c + h = 1088
         if weights is None:
             self.weights = np.zeros(self.input_dim, dtype=np.float32)
         else:
-            w = np.asarray(weights, dtype=np.float32).reshape(-1)
-            if w.shape[0] != self.input_dim:
-                raise ValueError(f"weights must have shape ({self.input_dim},)")
-            self.weights = w
+            self.weights = np.asarray(weights, dtype=np.float32).flatten()
 
-    @staticmethod
-    def _to_numpy_cpu(x):
-        if isinstance(x, torch.Tensor):
-            return x.detach().cpu().numpy().reshape(-1)
-        return np.asarray(x, dtype=np.float32).reshape(-1)
+    def act(self, z, h, c):
+        """Compute action from current state.
 
-    def forward(self, z, h, c):
-        self.z = self._to_numpy_cpu(z).astype(np.float32)
-        self.h = self._to_numpy_cpu(h).astype(np.float32)
-        self.c = self._to_numpy_cpu(c).astype(np.float32)
+        Args:
+            z: (64,) numpy array
+            h: (512,) numpy array
+            c: (512,) numpy array
 
-        x = np.concatenate([self.z, self.h, self.c], axis=0)
-        if x.shape[0] != self.input_dim:
-            raise ValueError(
-                f"Concatenated input must be {self.input_dim}, got {x.shape[0]}"
-            )
+        Returns:
+            action: int (0, 1, or 2)
+            action_float: float for feeding to RNN
+        """
+        # Ha line 576: concatenate(z, c, h) — note c before h
+        obs = np.concatenate([z, c, h])
+        out = float(np.dot(self.weights, obs))
 
-        out = float(np.dot(self.weights, x))
+        # Discretize: Ha maps continuous [-1,1] to 3 actions
         if out < -0.33:
-            return 0
-        if out > 0.33:
-            return 2
-        return 1
+            return 0, 0.0  # left
+        elif out > 0.33:
+            return 2, 2.0  # right
+        else:
+            return 1, 1.0  # stay
 
 
-def dream_rollout(
-    mdn_rnn, controller, z_bank, device, temperature=1.15, max_steps=2100
-):
-    mdn_rnn.eval()
+# ================================================================
+# Dream rollout matching Ha's DoomCoverRNNEnv._step
+# ================================================================
+
+TEMPERATURE = 1.25  # Ha line 24
+MAX_FRAMES = 2100  # Ha line 560
+
+
+def dream_rollout(rnn, controller, initial_z_data, device):
+    """Run one episode in the dream environment.
+
+    Matches Ha's DoomCoverRNNEnv reset + step loop.
+    Returns number of steps survived (reward = 1 per step).
+    """
+    rnn.eval()
 
     with torch.no_grad():
-        if isinstance(z_bank, torch.Tensor):
-            start_idx = np.random.randint(0, z_bank.shape[0])
-            z = z_bank[start_idx].to(device=device, dtype=torch.float32).reshape(-1)
-        else:
-            z_arr = np.asarray(z_bank, dtype=np.float32)
-            start_idx = np.random.randint(0, z_arr.shape[0])
-            z = (
-                torch.from_numpy(z_arr[start_idx])
-                .to(device=device, dtype=torch.float32)
-                .reshape(-1)
+        # Sample initial z (Ha lines 566-572)
+        idx = np.random.randint(0, len(initial_z_data["mu"]))
+        init_mu = initial_z_data["mu"][idx]
+        init_logvar = initial_z_data["logvar"][idx]
+        z = init_mu + np.exp(init_logvar / 2.0) * np.random.randn(*init_logvar.shape)
+
+        # Initial state (Ha lines 579-583)
+        state = rnn.init_state(1, device)
+        restart = 1.0  # First step is a restart
+
+        for step in range(MAX_FRAMES):
+            # Get h, c as numpy for controller
+            h_np = state[0][0].cpu().numpy()  # (rnn_size,)
+            c_np = state[1][0].cpu().numpy()  # (rnn_size,)
+
+            # Controller action
+            _, action_float = controller.act(z, h_np, c_np)
+
+            # RNN step
+            z_tensor = torch.from_numpy(z).float().unsqueeze(0).to(device)  # (1, 64)
+            logmix, mean, logstd, restart_logit, state = rnn.forward_step(
+                z_tensor, action_float, restart, state
             )
 
-        hidden = (
-            torch.zeros(1, 1, mdn_rnn.hidden_dim, device=device),
-            torch.zeros(1, 1, mdn_rnn.hidden_dim, device=device),
-        )
+            # Sample next z
+            z = rnn.sample_z(logmix, mean, logstd, temperature=TEMPERATURE)
 
-        cumulative_survival = 1.0
+            # Check termination (Ha line 644: logrestart[0] > 0)
+            if restart_logit > 0:
+                restart = 1.0
+                return step + 1  # reward = steps survived
+            else:
+                restart = 0.0
 
-        for step in range(max_steps):
-            h_cpu = hidden[0].squeeze(0).squeeze(0).detach().cpu()
-            c_cpu = hidden[1].squeeze(0).squeeze(0).detach().cpu()
-            action_id = controller.forward(z.detach().cpu(), h_cpu, c_cpu)
-
-            z_in = z.view(1, 1, -1)
-            action_in = torch.tensor([[action_id]], device=device)
-            mdn_out, death_logits, hidden = mdn_rnn(z_in, action_in, hidden)
-
-            pi, mu, sigma = mdn_rnn.get_mdn_params(mdn_out)
-            z_next = mdn_rnn.sample(pi, mu, sigma * temperature).squeeze(0).squeeze(0)
-
-            death_prob = torch.sigmoid(death_logits[:, -1, :]).item()
-            cumulative_survival *= 1.0 - death_prob
-            z = z_next
-            # Episode ends when cumulative survival drops below threshold
-            if cumulative_survival < 0.01:
-                return step + 1
-
-        return max_steps
+        return MAX_FRAMES
 
 
-def init_worker(
-    mdn_rnn_ckpt_path,
-    z_bank_path,
-    device,
-    latent_dim=64,
-    action_dim=3,
-    hidden_dim=512,
-    n_gaussians=5,
-):
-    global _WORKER_MDN_RNN, _WORKER_Z_BANK, _WORKER_DEVICE
+# ================================================================
+# Worker pool for parallel evaluation
+# ================================================================
 
-    if str(device).startswith("cuda") and not torch.cuda.is_available():
-        _WORKER_DEVICE = torch.device("cpu")
-    else:
-        _WORKER_DEVICE = torch.device(device)
+_WORKER_RNN = None
+_WORKER_INIT_Z = None
+_WORKER_DEVICE = None
 
-    # Build and load a worker-local MDN-RNN copy.
-    _WORKER_MDN_RNN = MDNRNN(
-        latent_dim=latent_dim,
-        action_dim=action_dim,
-        hidden_dim=hidden_dim,
-        n_gaussians=n_gaussians,
-    ).to(_WORKER_DEVICE)
 
-    ckpt = torch.load(mdn_rnn_ckpt_path, map_location=_WORKER_DEVICE)
-    state_dict = (
-        ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
-    )
-    _WORKER_MDN_RNN.load_state_dict(state_dict)
-    _WORKER_MDN_RNN.eval()
+def init_worker(rnn_path, init_z_path, device_str):
+    global _WORKER_RNN, _WORKER_INIT_Z, _WORKER_DEVICE
 
-    # Load worker-local latent bank copy.
-    if z_bank_path.endswith(".pt"):
-        z_bank_obj = torch.load(z_bank_path, map_location="cpu")
-        if isinstance(z_bank_obj, torch.Tensor):
-            z_bank_arr = z_bank_obj.detach().cpu().numpy()
-        else:
-            z_bank_arr = np.asarray(z_bank_obj, dtype=np.float32)
-    elif z_bank_path.endswith(".npz"):
-        z_bank_npz = np.load(z_bank_path)
-        first_key = list(z_bank_npz.keys())[0]
-        z_bank_arr = z_bank_npz[first_key]
-    else:
-        z_bank_arr = np.load(z_bank_path)
+    _WORKER_DEVICE = torch.device(device_str)
 
-    _WORKER_Z_BANK = torch.as_tensor(
-        z_bank_arr, dtype=torch.float32, device=_WORKER_DEVICE
-    )
+    _WORKER_RNN = MDNRNN(z_size=64, n_mix=5, rnn_size=512).to(_WORKER_DEVICE)
+    ckpt = torch.load(rnn_path, map_location=_WORKER_DEVICE)
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        ckpt = ckpt["state_dict"]
+    _WORKER_RNN.load_state_dict(ckpt)
+    _WORKER_RNN.eval()
+
+    data = np.load(init_z_path)
+    _WORKER_INIT_Z = {"mu": data["mu"], "logvar": data["logvar"]}
 
 
 def evaluate_worker(args):
-    weights, num_rollouts, temperature, max_steps = args
+    weights, num_rollouts = args
+    controller = Controller(weights=weights)
 
-    if _WORKER_MDN_RNN is None or _WORKER_Z_BANK is None or _WORKER_DEVICE is None:
-        raise RuntimeError("Worker not initialized. Call init_worker first.")
-
-    controller = ControllerVizDoom(weights=weights)
     rewards = []
     for _ in range(num_rollouts):
-        reward = dream_rollout(
-            _WORKER_MDN_RNN,
-            controller,
-            _WORKER_Z_BANK,
-            _WORKER_DEVICE,
-            temperature=temperature,
-            max_steps=max_steps,
-        )
-        rewards.append(reward)
+        r = dream_rollout(_WORKER_RNN, controller, _WORKER_INIT_Z, _WORKER_DEVICE)
+        rewards.append(r)
 
     return float(np.mean(rewards))
 
 
+# ================================================================
+# Main: CMA-ES
+# ================================================================
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--vae_path", type=str, default="../outputs/vizdoom/vae.pth")
-    parser.add_argument(
-        "--mdn_path", type=str, default="../outputs/vizdoom/mdn_rnn.pth"
-    )
-    parser.add_argument(
-        "--frames_path", type=str, default="../outputs/vizdoom/frames.npy"
-    )
-    parser.add_argument("--output_dir", type=str, default="../outputs/vizdoom")
-    parser.add_argument("--gens", type=int, default=200)
+    parser.add_argument("--data_dir", type=str, default="../outputs/vizdoom/iter0")
+    parser.add_argument("--output", type=str, default="../outputs/vizdoom/iter0")
+    parser.add_argument("--gens", type=int, default=300)
     parser.add_argument("--popsize", type=int, default=64)
-    parser.add_argument("--rollouts", type=int, default=16)
-    parser.add_argument("--temperature", type=float, default=1.15)
-    parser.add_argument("--max_steps", type=int, default=2100)
+    parser.add_argument(
+        "--rollouts", type=int, default=16, help="Rollouts per candidate per generation"
+    )
     parser.add_argument("--workers", type=int, default=12)
-    parser.add_argument("--z_bank_size", type=int, default=5000)
+    parser.add_argument(
+        "--sigma", type=float, default=0.5, help="Initial CMA-ES step size"
+    )
     args = parser.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    import cma
 
-    # === Phase 1: Build z bank from real frames ===
-    print("Building z bank from real frames...")
-    vae = ConvVAE(latent_dim=64)
-    vae.load_state_dict(torch.load(args.vae_path, map_location=device))
-    vae.to(device)
-    vae.eval()
+    os.makedirs(args.output, exist_ok=True)
 
-    frames = np.load(args.frames_path)
-    # Sample a subset if we have more than z_bank_size
-    if len(frames) > args.z_bank_size:
-        indices = np.random.choice(len(frames), args.z_bank_size, replace=False)
-        frames = frames[indices]
+    rnn_path = os.path.join(args.data_dir, "mdn_rnn.pth")
+    init_z_path = os.path.join(args.data_dir, "initial_z.npz")
 
-    frames_tensor = torch.from_numpy(frames).float() / 255.0
-    frames_tensor = frames_tensor.permute(0, 3, 1, 2)
+    assert os.path.exists(rnn_path), f"MDN-RNN not found: {rnn_path}"
+    assert os.path.exists(init_z_path), f"initial_z not found: {init_z_path}"
 
-    all_z = []
-    with torch.no_grad():
-        for i in range(0, len(frames_tensor), 256):
-            batch = frames_tensor[i : i + 256].to(device)
-            mu, _ = vae.encode(batch)
-            all_z.append(mu.cpu())
+    n_params = 1088  # z(64) + c(512) + h(512)
+    print(f"Controller params: {n_params}")
+    print(f"CMA-ES: popsize={args.popsize}, σ={args.sigma}, gens={args.gens}")
+    print(f"Rollouts per eval: {args.rollouts}")
+    print(f"Workers: {args.workers}")
+    print(f"Temperature: {TEMPERATURE}")
+    print(f"Max frames: {MAX_FRAMES}")
 
-    z_bank = torch.cat(all_z, dim=0)
-    z_bank_path = os.path.join(args.output_dir, "z_bank.npy")
-    np.save(z_bank_path, z_bank.numpy())
+    # Quick sanity: run one rollout
+    print("\nSanity check: running one dream rollout...")
+    rnn = MDNRNN(z_size=64, n_mix=5, rnn_size=512)
+    rnn.load_state_dict(torch.load(rnn_path, map_location="cpu"))
+    rnn.eval()
+    init_z = np.load(init_z_path)
+    init_z_dict = {"mu": init_z["mu"], "logvar": init_z["logvar"]}
 
-    print(f"z bank: {z_bank.shape} saved to {z_bank_path}")
+    test_ctrl = Controller()  # zero weights
+    test_reward = dream_rollout(rnn, test_ctrl, init_z_dict, torch.device("cpu"))
+    print(f"  Zero-weight controller survived {test_reward} steps")
+    del rnn
 
-    # VAE no longer needed
-    del vae, frames, frames_tensor, all_z
-    # === Phase 2: CMA-ES Evolution ===
-    n_params = 1088
-    print(
-        f"\nStarting CMA-ES: {n_params} params, pop={args.popsize}, "
-        f"τ={args.temperature}, rollouts={args.rollouts}"
-    )
-
+    # Start CMA-ES
     es = cma.CMAEvolutionStrategy(
-        n_params * [0],
-        0.5,
+        n_params * [0.0],
+        args.sigma,
         {"popsize": args.popsize},
     )
 
-    print(f"Initializing {args.workers} workers...")
+    print(f"\nInitializing {args.workers} worker processes...")
     pool = multiprocessing.Pool(
         processes=args.workers,
         initializer=init_worker,
-        initargs=(args.mdn_path, z_bank_path, "cpu"),
+        initargs=(rnn_path, init_z_path, "cpu"),
     )
 
-    history = {"generation": [], "best": [], "mean": [], "worst": []}
+    history = {"gen": [], "best": [], "mean": [], "worst": []}
+    best_ever = 0
 
     try:
         for gen in range(args.gens):
             t0 = time.time()
 
             solutions = es.ask()
-            eval_args = [
-                (weights, args.rollouts, args.temperature, args.max_steps)
-                for weights in solutions
-            ]
+            eval_args = [(w, args.rollouts) for w in solutions]
             rewards = pool.map(evaluate_worker, eval_args)
 
-            # CMA-ES minimizes, so negate
+            # CMA-ES minimizes, negate rewards
             es.tell(solutions, [-r for r in rewards])
 
             best = max(rewards)
             mean = np.mean(rewards)
             worst = min(rewards)
 
-            history["generation"].append(gen)
+            if best > best_ever:
+                best_ever = best
+                np.save(
+                    os.path.join(args.output, "controller_best.npy"), es.result.xbest
+                )
+
+            history["gen"].append(gen)
             history["best"].append(best)
             history["mean"].append(mean)
             history["worst"].append(worst)
@@ -285,24 +256,24 @@ if __name__ == "__main__":
             elapsed = time.time() - t0
             print(
                 f"Gen {gen:3d} | Best: {best:7.1f} | Mean: {mean:7.1f} | "
-                f"Worst: {worst:7.1f} | Time: {elapsed:.1f}s"
+                f"Worst: {worst:7.1f} | Best-ever: {best_ever:7.1f} | {elapsed:.1f}s"
             )
 
-            # Checkpoint every 25 generations
+            # Checkpoint every 25 gens
             if gen % 25 == 0:
                 np.save(
-                    os.path.join(args.output_dir, "controller_params.npy"),
-                    es.result.xbest,
+                    os.path.join(args.output, "controller_params.npy"), es.result.xbest
                 )
+                np.savez(os.path.join(args.output, "controller_history.npz"), **history)
 
     finally:
         pool.close()
         pool.join()
 
-    # Save final results
-    np.save(os.path.join(args.output_dir, "controller_params.npy"), es.result.xbest)
-    np.save(os.path.join(args.output_dir, "training_history.npy"), history)
+    # Final save
+    np.save(os.path.join(args.output, "controller_params.npy"), es.result.xbest)
+    np.savez(os.path.join(args.output, "controller_history.npz"), **history)
 
     print(f"\nTraining complete!")
-    print(f"Best survival time: {max(history['best']):.1f} steps")
+    print(f"Best-ever survival: {best_ever:.1f} steps")
     print(f"Final mean: {history['mean'][-1]:.1f} steps")
