@@ -3,10 +3,19 @@ import torch.nn as nn
 
 
 class ConvVAE(nn.Module):
-    def __init__(self, latent_dim=32):
-        super().__init__()
+    """VAE matching Ha's doomrnn.py ConvVAE architecture.
 
-        # Encoder: kernel=4, stride=2, NO padding (paper architecture)
+    Key: uses kl_tolerance (free bits) to prevent posterior collapse.
+    Ha's default: kl_tolerance=0.5, meaning each latent dim must encode
+    at least 0.5 nats of information.
+    """
+
+    def __init__(self, latent_dim=32, kl_tolerance=0.5):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.kl_tolerance = kl_tolerance
+
+        # Encoder: kernel=4, stride=2, NO padding (Ha lines 100-103)
         self.conv1 = nn.Conv2d(3, 32, 4, stride=2)  # 64 -> 31
         self.conv2 = nn.Conv2d(32, 64, 4, stride=2)  # 31 -> 14
         self.conv3 = nn.Conv2d(64, 128, 4, stride=2)  # 14 -> 6
@@ -15,7 +24,7 @@ class ConvVAE(nn.Module):
         self.fc_mu = nn.Linear(1024, latent_dim)
         self.fc_logvar = nn.Linear(1024, latent_dim)
 
-        # Decoder
+        # Decoder (Ha lines 114-119)
         self.fc_decode = nn.Linear(latent_dim, 1024)
         self.deconv1 = nn.ConvTranspose2d(1024, 128, 5, stride=2)  # 1 -> 5
         self.deconv2 = nn.ConvTranspose2d(128, 64, 5, stride=2)  # 5 -> 13
@@ -54,20 +63,49 @@ class ConvVAE(nn.Module):
         return recon, mu, logvar
 
     def loss_function(self, recon, x, mu, logvar):
-        recon_loss = nn.functional.mse_loss(recon, x, reduction="sum")
-        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        """Loss matching Ha's VAE exactly.
+
+        Ha's code (lines 137-151):
+          r_loss = reduce_mean(reduce_sum(square(x - y), [1,2,3]))
+          kl_loss = reduce_mean(max(-0.5 * reduce_sum(1+logvar-mu^2-exp(logvar), [1]),
+                                    kl_tolerance * z_size))
+          loss = r_loss + kl_loss
+
+        The kl_tolerance floor is CRITICAL - it prevents posterior collapse
+        by ensuring each latent dim encodes at least kl_tolerance nats.
+        """
+        # Reconstruction: sum over pixels (H,W,C), mean over batch
+        recon_loss = torch.sum((recon - x) ** 2, dim=[1, 2, 3])  # (batch,)
+        recon_loss = torch.mean(recon_loss)
+
+        # KL with tolerance floor (Ha lines 144-149)
+        # Per-sample KL: sum over latent dims
+        kl_per_sample = -0.5 * torch.sum(
+            1 + logvar - mu.pow(2) - logvar.exp(), dim=1
+        )  # (batch,)
+
+        # Floor at kl_tolerance * latent_dim (Ha line 148)
+        kl_per_sample = torch.maximum(
+            kl_per_sample,
+            torch.tensor(self.kl_tolerance * self.latent_dim, device=mu.device),
+        )
+        kl_loss = torch.mean(kl_per_sample)
+
         return recon_loss + kl_loss, recon_loss, kl_loss
 
 
 if __name__ == "__main__":
-    # This only runs when you execute vae.py directly
-    model = ConvVAE(latent_dim=32)
-    fake_image = torch.randn(1, 3, 64, 64)
+    model = ConvVAE(latent_dim=64, kl_tolerance=0.5)
+    fake_image = torch.randn(4, 3, 64, 64).clamp(0, 1)
     recon, mu, logvar = model(fake_image)
 
     total_loss, recon_loss, kl_loss = model.loss_function(recon, fake_image, mu, logvar)
 
+    params = sum(p.numel() for p in model.parameters())
+    print(f"Params: {params:,}")
     print(f"Input: {fake_image.shape}")
     print(f"Reconstruction: {recon.shape}")
     print(f"Total loss: {total_loss.item():.2f}")
     print(f"Recon loss: {recon_loss.item():.2f}, KL loss: {kl_loss.item():.2f}")
+    print(f"KL floor: {0.5 * 64} = {0.5 * 64:.1f}")
+    print(f"mu std: {mu.std():.4f}")
