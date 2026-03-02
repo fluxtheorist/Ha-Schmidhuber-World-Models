@@ -29,7 +29,7 @@ class ZOnlyController:
 
     def act(self, z):
         hidden = np.tanh(self.W1 @ z + self.b1)
-        out = float(self.W2 @ hidden + self.b2)
+        out = float((self.W2 @ hidden + self.b2)[0])
         if out < -0.33:
             return 0  # stay
         elif out > 0.33:
