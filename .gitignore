@@ -5,3 +5,4 @@ simple_autoencoder.py
 __pycache__
 *.pyc
 reorganize_repo.sh*.ini
+_vizdoom.ini
