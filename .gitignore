@@ -4,4 +4,4 @@ outputs
 simple_autoencoder.py
 __pycache__
 *.pyc
-reorganize_repo.sh
+reorganize_repo.sh*.ini
